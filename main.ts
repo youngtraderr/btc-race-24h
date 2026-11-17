@@ -21,11 +21,12 @@ interface Series {
 
 /** One EMA: moving average of closes. */
 function stepEma(e: Ema, close: number): void {
+  const c = Number(close);
   if (e.value !== null) {
-    e.value += (2 / (e.span + 1)) * (close - e.value);
+    e.value += (2 / (e.span + 1)) * (c - e.value);
     return;
   }
-  e.warm.push(close);
+  e.warm.push(c);
   if (e.warm.length === e.span) {
     const sum = e.warm.reduce((a, x) => a + x, 0);
     e.value = sum / e.span;
