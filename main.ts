@@ -26,7 +26,10 @@ function stepEma(e: Ema, close: number): void {
     return;
   }
   e.warm.push(close);
-  if (e.warm.length === e.span) e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;
+  if (e.warm.length === e.span) {
+    const sum = e.warm.reduce((a, x) => a + x, 0);
+    e.value = sum / e.span;
+  }
 }
 
 /** Initialize series state for a symbol. */
