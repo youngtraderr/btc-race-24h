@@ -1,9 +1,11 @@
-
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const FAST_BARS = 8;
-const SLOW_BARS = 21;
+const LOOKBACK = 24;
+const BUY_THRESHOLD_BPS = 200;  // Buy if price up 200 bps from entry reference
+const TRAILING_STOP_BPS = 800;  // Sell if price down 800 bps from peak
 const MAX_SLIPPAGE_BPS = 100;
+
+const series = new Map<string, Series>();
 
 interface Ema {
   span: number;
@@ -12,15 +14,13 @@ interface Ema {
 }
 
 interface Series {
-  fast: Ema;
-  slow: Ema;
-  gap: number | null;
-  now: number | null;
+  ema: Ema;
+  peak: bigint;  // peak close price since entry
+  invested: boolean;
 }
 
-const series = new Map<string, Series>();
-
-function step(e: Ema, close: number): void {
+/** One EMA: moving average of closes. */
+function stepEma(e: Ema, close: number): void {
   if (e.value !== null) {
     e.value += (2 / (e.span + 1)) * (close - e.value);
     return;
@@ -29,54 +29,96 @@ function step(e: Ema, close: number): void {
   if (e.warm.length === e.span) e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;
 }
 
-function push(bar: Bar): Series {
-  let s = series.get(bar.symbol);
-  if (s === undefined) {
-    s = { fast: { span: FAST_BARS, warm: [], value: null }, slow: { span: SLOW_BARS, warm: [], value: null }, gap: null, now: null };
-    series.set(bar.symbol, s);
+/** Initialize series state for a symbol. */
+function initSeries(): Series {
+  return { ema: { span: 8, warm: [], value: null }, peak: 0n, invested: false };
+}
+
+/** Process a bar: update EMA and check exit signals. */
+function processBar(s: Series, close: number): { buy: boolean; sell: boolean } {
+  stepEma(s.ema, close);
+  
+  let buy = false;
+  let sell = false;
+  
+  if (!s.invested) {
+    // Not invested: check if price shows upward EMA momentum
+    if (s.ema.value !== null && s.ema.value > 0) {
+      buy = true;
+      s.invested = true;
+      // Set peak to current close price (scaled to integer)
+      s.peak = BigInt(Math.round(close * 1e8));
+    }
+  } else {
+    // Invested: check trailing stop
+    const currentPrice = BigInt(Math.round(close * 1e8));
+    if (s.peak > 0n) {
+      // trailing stop: peak * (1 - TRAILING_STOP_BPS / 10000)
+      const stopLevel = s.peak - (s.peak * BigInt(TRAILING_STOP_BPS)) / BigInt(10000);
+      if (currentPrice <= stopLevel) {
+        sell = true;
+        s.invested = false;
+      }
+    }
   }
-  const c = Number(bar.c);
-  step(s.fast, c);
-  step(s.slow, c);
-  s.gap = s.now;
-  s.now = s.fast.value !== null && s.slow.value !== null ? s.fast.value - s.slow.value : null;
-  return s;
+  
+  return { buy, sell };
 }
 
 await runBars({
+  onHello() {
+    // Series initialized per symbol on first bar
+  },
   onBatch(state, batch) {
-    const crossUp = new Set<string>();
-    const crossDown = new Set<string>();
-    for (const bar of batch.bars) {
-      const s = push(bar);
-      if (s.gap === null || s.now === null) continue;
-      if (s.now > 0 && s.gap <= 0) crossUp.add(bar.symbol);
-      if (s.now < 0 && s.gap >= 0) crossDown.add(bar.symbol);
-    }
-    if (state.warmingUp) return [];
     const { caps, fees } = state.hello;
     const sells: SellInput[] = [];
-    const entries: string[] = [];
+    const buySymbols: string[] = [];
+    
+    // Process each symbol
     for (const { symbol } of state.hello.symbols) {
       const held = state.positions.get(symbol);
+      
       if (held !== undefined) {
-        if (crossDown.has(symbol)) sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      } else if (crossUp.has(symbol)) entries.push(symbol);
+        // We hold this symbol - check trailing stop
+        if (!series.has(symbol)) series.set(symbol, initSeries());
+        const s = series.get(symbol)!;
+        const { buy: buyResult, sell: sellResult } = processBar(s, state.close(symbol));
+        if (sellResult) {
+          sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        }
+      } else {
+        // Not holding this symbol - consider buying
+        if (!series.has(symbol)) series.set(symbol, initSeries());
+        const s = series.get(symbol)!;
+        const { buy: buyResult } = processBar(s, state.close(symbol));
+        if (buyResult) {
+          buySymbols.push(symbol);
+        }
+      }
     }
-    const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);
+    
+    // Build orders: sells first, then buys
+    const orders: (SellInput | BuyInput)[] = [...sells];
+    
+    // Add buys (max 1 open position)
     const slots = Math.min(state.hello.symbols.length, caps.max_open_positions);
-    const stake = state.equity / BigInt(slots);
     let room = slots - state.positions.size;
     let cash = state.cash;
-    for (const symbol of entries) {
+    
+    for (const symbol of buySymbols) {
       if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
-      let slice = stake;
-      if (cash < slice) slice = cash;
-      if (slice < BigInt(fees.min_notional_quote_units)) continue;
-      orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
-      cash -= slice;
-      room--;
+      // Buy: spend up to max weight but at least 1 USDC
+      const maxNotional = Math.min(
+        state.equity * BigInt(caps.max_weight_bps) / BPS,
+        state.cash
+      );
+      if (maxNotional >= BigInt(fees.min_notional_quote_units)) {
+        orders.push({ side: 'buy', symbol, notional_quote_units: maxNotional, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        cash -= maxNotional;
+        room--;
+      }
     }
+    
     return orders;
   },
 });
