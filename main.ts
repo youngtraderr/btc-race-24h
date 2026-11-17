@@ -39,8 +39,9 @@ function initSeries(): Series {
 }
 
 /** Process a bar: update EMA and check exit signals. */
-function processBar(s: Series, close: number): { buy: boolean; sell: boolean } {
-  stepEma(s.ema, close);
+function processBar(s: Series, close: bigint): { buy: boolean; sell: boolean } {
+  const c = Number(close);
+  stepEma(s.ema, c);
   
   let buy = false;
   let sell = false;
@@ -51,11 +52,11 @@ function processBar(s: Series, close: number): { buy: boolean; sell: boolean } {
       buy = true;
       s.invested = true;
       // Set peak to current close price (scaled to integer)
-      s.peak = BigInt(Math.round(close * 1e8));
+      s.peak = close;
     }
   } else {
     // Invested: check trailing stop
-    const currentPrice = BigInt(Math.round(close * 1e8));
+    const currentPrice = close;
     if (s.peak > 0n) {
       // trailing stop: peak * (1 - TRAILING_STOP_BPS / 10000)
       const stopLevel = s.peak - (s.peak * BigInt(TRAILING_STOP_BPS)) / BigInt(10000);
