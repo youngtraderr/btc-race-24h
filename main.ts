@@ -113,10 +113,8 @@ await runBars({
     for (const symbol of buySymbols) {
       if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
       // Buy: spend up to max weight but at least 1 USDC
-      const maxNotional = Math.min(
-        state.equity * BigInt(caps.max_weight_bps) / BPS,
-        state.cash
-      );
+      const byWeight = state.equity * BigInt(caps.max_weight_bps) / BPS;
+      const maxNotional = state.cash < byWeight ? state.cash : byWeight;
       if (maxNotional >= BigInt(fees.min_notional_quote_units)) {
         orders.push({ side: 'buy', symbol, notional_quote_units: maxNotional, max_slippage_bps: MAX_SLIPPAGE_BPS });
         cash -= maxNotional;
